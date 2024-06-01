@@ -1,9 +1,8 @@
 import collections
+import itertools
 import json
 import os
-import pathlib
-import pickle
-from typing import cast, Literal
+from typing import cast, Literal, Optional
 from typing_extensions import get_args
 from functools import lru_cache
 
@@ -17,15 +16,6 @@ from langchain_community.embeddings.sentence_transformer import SentenceTransfor
 from hippollm.storage import EntityStore
 
 __all__ = ["Search", "create_app"]
-
-
-# def save_metadata(origin, source):
-#     """Export metadata to the library."""
-#     with open(origin, "r") as f:
-#         metadata = json.load(f)
-
-#     with open(source, "w") as f:
-#         json.dump(metadata, f, indent=4)
 
 TQueryType = Literal["entity", "fact"]
 
@@ -44,18 +34,6 @@ class Search:
         self.triples = collections.defaultdict(tuple)
         self.relations = collections.defaultdict(list)
 
-    # def save(self, path):
-    #     """Save the search object."""
-    #     with open(path, "wb") as f:
-    #         pickle.dump(self, f)
-    #     return self
-
-    # def load_metadata(self, path):
-    #     """Load metadata"""
-    #     with open(path, "r") as f:
-    #         self.metadata = json.load(f)
-    #     return self
-
     # @lru_cache(maxsize=10000)
     def explore(self, 
                 origin: str, 
@@ -63,9 +41,16 @@ class Search:
                 visited: set[str],
                 depth: int, 
                 max_depth: int,
+                max_relations: Optional[int] = None,
                 ) -> list[str]:
         depth += 1
-        for neighbour, facts in self.storage.get_neighbours(origin, return_facts=True):
+        neighbour_facts = self.storage.get_neighbours(origin, return_facts=True)
+        if max_relations is not None:
+            neighbour_facts = sorted(
+                neighbour_facts, key=lambda x: len(x[1]), reverse=True
+                )[:max_relations]
+        
+        for neighbour, facts in neighbour_facts:
             relations += [tuple([origin, facts, neighbour])]
             if depth < max_depth and neighbour not in visited:
                 visited.add(neighbour)
@@ -83,60 +68,98 @@ class Search:
                  query_type: TQueryType, 
                  k: int, 
                  n: int, 
-                 p: int
+                 p: Optional[int] = None,
                  ) -> dict[str, list[dict[str, str]]]:
         nodes, links = [], []
+        nodes_map = {}
         # prune = collections.defaultdict(int)
 
         for q in query.split(";"):
             q = q.strip()
             if query_type == "entity":
                 entities = self.storage.get_closest_entities(q, k)
+                print(entities)
             elif query_type == "fact":
                 facts = self.storage.get_closest_facts(q, k)
                 entities = set()
                 for fact in facts:
-                    entities.add(fact.entities)
+                    entities.update(fact.entities)
                 entities = [self.storage.get_entity(e) for e in entities]
 
+        # Add nodes
         for group, e in enumerate(entities):
-            nodes.append(
-                {
+            node = {
                     "id": e.name,
                     "group": group,
                     "color": "#960018",
                     "fontWeight": "bold",
-                    "metadata": e.description,
+                    "description": e.description,
+                    "facts": {},
                 }
-            )
+            nodes.append(node)
+            nodes_map[e.name] = node
+            
 
-        # Search for neighbours
-        already_seen = {e.name for e in entities}
-        added_to_plot = already_seen.copy()
-        for group, e in enumerate(entities):
-            color = self.colors[group % len(self.colors)]
-            match = self.explore(e.name, [], already_seen, 0, n)
-            for a, fcts, b in list(match):
-                for x in (a, b):
-                    if x not in added_to_plot:
-                        x_ent = self.storage.get_entity(x)
-                        nodes.append(
-                            {
+        # Search for neighbours (in entity query mode only)
+        if query_type == "entity":
+            already_seen = {e.name for e in entities}
+            added_to_plot = already_seen.copy()
+            for group, e in enumerate(entities):
+                color = self.colors[group % len(self.colors)]
+                relations = self.explore(e.name, [], already_seen, 0, n, p)
+                for a, fcts, b in list(relations):
+                    for x in (a, b):
+                        if x not in added_to_plot:
+                            x_ent = self.storage.get_entity(x)
+                            node = {
                                 "id": x,
                                 "group": group,
                                 "color": color,
-                                "metadata": x_ent.description,
+                                "description": x_ent.description,
+                                "facts": {},
                             }
-                        )
-                        added_to_plot.add(x)
-                links.append(
-                    {
-                        "source": a,
-                        "target": b,
-                        "value": 1,
-                        "relation": str(fcts),
-                    }
-                )
+                            nodes.append(node)
+                            nodes_map[x] = node
+                            added_to_plot.add(x)
+                    links.append(
+                        {
+                            "source": a,
+                            "target": b,
+                            "value": len(fcts),
+                            "relation": str(fcts),
+                            "facts": {
+                                str(fc): self.storage.get_fact(fc).text for fc in fcts
+                            },
+                        }
+                    )
+                    for fc in fcts:
+                        nodes_map[a]["facts"][str(fc)] = self.storage.get_fact(fc).text
+                        nodes_map[b]["facts"][str(fc)] = self.storage.get_fact(fc).text
+        
+        # Add links (in fact query mode only)
+        if query_type == "fact":
+            links_map = {}
+            for fact in facts:
+                # Add all links between entities
+                for (a, b) in itertools.combinations(fact.entities, 2):
+                    if frozenset([a, b]) not in links_map:
+                        link = {
+                            "source": a,
+                            "target": b,
+                            "value": 1,
+                            "relation": str(fact.id),
+                            "facts": {str(fact.id): fact.text},
+                        }
+                        links.append(link)
+                        links_map[frozenset([a, b])] = link
+                    else:
+                        links_map[frozenset([a, b])]["value"] += 1
+                        links_map[frozenset([a, b])]["facts"][str(fact.id)] = fact.text
+                 
+                # Add fact to nodes    
+                for e in fact.entities:
+                    nodes_map[e]["facts"][str(fact.id)] = fact.text   
+        
         # Prune
         # if p > 1:
         #     links = [
